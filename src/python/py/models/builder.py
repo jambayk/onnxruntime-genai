@@ -33,7 +33,6 @@ class Model:
         self.vocab_size = config.vocab_size
         self.activation = config.hidden_act
 
-        self.model_name_or_path = config._name_or_path
         self.model_type = config.architectures[0]
         self.io_dtype = io_dtype      # {'fp16', 'fp32'}
         self.onnx_dtype = onnx_dtype  # {"int4", "fp16", "fp32"}
@@ -41,6 +40,9 @@ class Model:
         self.cache_dir = cache_dir
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
         self.extra_options = extra_options
+
+        # lora-specific variables
+        self.merge_lora_scaling = extra_options.get("merge_lora_scaling", "0") == "1"
 
         self.inputs = []
         self.outputs = []
@@ -512,10 +514,11 @@ class Model:
         self.make_node("Cast", inputs=[root_input], outputs=[output], name=name, to=dtype)
         self.make_value_info(output, dtype, shape=shape)
 
-    def make_add(self, name, inputs, dtype, shape):
-        output = f"{name}/output_0"
+    def make_add(self, name, inputs, dtype, shape, **kwargs):
+        output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
         self.make_node("Add", inputs=inputs, outputs=[output], name=name)
         self.make_value_info(output, dtype, shape=shape)
+        return output
 
     def make_sub(self, name, inputs, dtype, shape):
         output = f"{name}/output_0"
@@ -541,14 +544,92 @@ class Model:
         output = f"{name}/output_0"
         self.make_node("Mul", inputs=inputs, outputs=[output], name=name)
         self.make_value_info(output, dtype, shape=shape)
+        return output
 
     def make_transpose(self, name, root_input, dtype, shape, perm):
         output = f"{name}/output_0"
         self.make_node("Transpose", inputs=[root_input], outputs=[output], name=name, perm=perm)
         self.make_value_info(output, dtype, shape=shape)
 
+    def make_split(self, name, root_input, axis, split, dtype, shape):
+        outputs = [f"{name}/output_{i}" for i in range(len(split))]
+        self.make_node(
+            "Split", 
+            inputs=[root_input, "/model/constants/TensorProto.INT64/1D/" + ",".join(map(str, split))], 
+            outputs=outputs, 
+            name=name, 
+            axis=axis
+        )
+        for output, size in zip(outputs, split):
+            shape[axis] = size
+            self.make_value_info(output, dtype, shape=shape)
+        return outputs
+
+    def make_matmul_or_lora(self, linear, name, root_input, **kwargs):
+        # Only MatMul:
+        # 
+        #       root_input
+        #           |
+        #         MatMul
+        # 
+        # LoRA: Mul node not present if merge_lora_scaling=True
+        # 
+        #       root_input
+        #       /        \
+        #    MatMul  lora_A_MatMul
+        #      |          |
+        #      |     lora_B_MatMul
+        #      |          |
+        #      |         Mul
+        #       \       /
+        #        \     /           
+        #          Add
+        # 
+        # TODO: consider checking for isinstance(linear, peft.tuners.lora.Linear) instead of hasattr
+        has_lora_adapters = hasattr(linear, "lora_A") and hasattr(linear, "lora_B")
+        logits = kwargs.get("logits", False)
+
+        # base linear layer
+        base_output = self.make_matmul(linear.weight.detach().numpy(), f"{name}/MatMul", root_input, logits=logits and not has_lora_adapters)
+        if not has_lora_adapters:
+            return base_output
+        
+        # lora adapters
+        lora_output = self.make_lora_adapters(
+            linear.lora_A.default.weight.detach().numpy(), 
+            linear.lora_B.default.weight.detach().numpy(), 
+            linear.scaling["default"], 
+            name, 
+            root_input
+        )
+
+        # add base_output and lora_output
+        add_output = self.make_add(f"{name}/lora/Add", [base_output, lora_output], dtype=self.io_dtype, shape=['batch_size', 'sequence_length', linear.weight.shape[0]], logits=logits)
+
+        return add_output
+
+    def make_lora_adapters(self, lora_A, lora_B, scaling, name, root_input):
+        # create the lora_A node
+        lora_A_output = self.make_matmul(lora_A, f"{name}/lora_A/MatMul", root_input)
+
+        # create the lora_B node
+        lora_B_output = self.make_matmul(lora_B * scaling if self.merge_lora_scaling else lora_B, f"{name}/lora_B/MatMul", lora_A_output)
+
+        if self.merge_lora_scaling:
+            return lora_B_output
+        
+        # create the scaling node
+        scaling_output = self.make_mul(
+            f"{name}/lora/Mul", 
+            [lora_B_output, f"/model/constants/{self.to_str_dtype[self.io_dtype]}/0D/{scaling}"], 
+            dtype=self.io_dtype, 
+            shape=['batch_size', 'sequence_length', lora_B.shape[0]]
+        )
+
+        return scaling_output
+
     def make_matmul(self, matmul, name, root_input, **kwargs):
-        self.make_matmul_fp16_or_fp32(matmul, name, root_input, **kwargs)
+        return self.make_matmul_fp16_or_fp32(matmul, name, root_input, **kwargs)
 
         # TODO: add other dtypes
         # if self.onnx_dtype in {"fp16", "fp32"}:
@@ -567,6 +648,49 @@ class Model:
         output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
         self.make_node("MatMul", inputs=[root_input, weight], outputs=[output], name=name)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', last_dim])
+        return output
+
+    def make_lora_split_add(self, lora_A, lora_B, scaling, name, root_input, add_inputs, split_names, splits):
+        # for cases where originally packed matmul is split into multiple matmuls
+        # lora cannot be split into multiple matmuls, so we split the output of lora
+        # and add them to the corresponding add_inputs which come from the base matmuls
+        #
+        # Example:
+        # 
+        #                      root_input
+        #                   /      |      \
+        #                  /       |       \
+        #                 /        |        \
+        #                /    lora_A_MatMul  \
+        #               /          |          \
+        #              /      lora_B_MatMul    \
+        #             |            |            |
+        #           MatMul_0      Mul       MatMul_1
+        #             |            |            |
+        #         add_input_0    Split     add_input_1
+        #              \       /       \       /
+        #               \     /         \     /
+        #                \   /           \   /
+        #                 Add             Add
+        # 
+        # create lora_nodes
+        lora_output = self.make_lora_adapters(lora_A, lora_B, scaling, name, root_input)
+
+        # split lora_output
+        split_outputs = self.make_split(f"{name}/lora/Split", lora_output, -1, splits, self.io_dtype, ['batch_size', 'sequence_length', sum(splits)])
+
+        # add split_outputs
+        outputs = []
+        for add_input, split_name, split, split_output in zip(add_inputs, split_names, splits, split_outputs):
+            output = self.make_add(
+                f"{name}/lora/{split_name}/Add", 
+                [add_input, split_output], 
+                dtype=self.io_dtype, 
+                shape=['batch_size', 'sequence_length', split]
+            )
+            outputs.append(output)
+
+        return outputs
 
     # TODO: quantize weights, then save new MatMul numpy weights for onnx model
     # def make_matmul_int4(self, matmul, name, root_input, **kwargs):
@@ -598,8 +722,9 @@ class Model:
             output = "logits"
             self.make_node("Add", inputs=add_bias_inputs, outputs=[output], name=name)
             self.make_value_info(output, dtype=self.io_dtype, shape=shape)
+            return output
         else:
-            self.make_add(name, add_bias_inputs, dtype=self.io_dtype, shape=shape)
+            return self.make_add(name, add_bias_inputs, dtype=self.io_dtype, shape=shape)
 
     def make_packed_add(self, q_add, k_add, v_add, name, root_input, **kwargs):
         # Combine 3 Adds of shape N_q, N_kv, and N_kv into 1 packed Add of shape N_q + N_kv + N_kv
@@ -964,22 +1089,58 @@ class Model:
         k_input_to_attention = ""
         v_input_to_attention = ""
 
+        # cannot do packed matmul if using LoRA adapters non-trivially
+        # TODO: consider tracing the qkv packed transformation for lora adapter outputs
+        has_lora_adapters = hasattr(attention.q_proj, "lora_A") and hasattr(attention.q_proj, "lora_B")
+
         # Make MatMul nodes
-        if self.attention_attrs["use_packed_matmul"]:
+        if self.attention_attrs["use_packed_matmul"] and not has_lora_adapters:
             # Combine 3 MatMuls into 1 packed MatMul
             qkv_matmul_name = f"/model/layers.{layer_id}/attn/qkv_proj/MatMul"
-            self.make_packed_matmul(attention.q_proj.weight.detach().numpy(), attention.k_proj.weight.detach().numpy(), attention.v_proj.weight.detach().numpy(), qkv_matmul_name, root_input)
-            q_input_to_attention = f"{qkv_matmul_name}/output_0"
+            q_input_to_attention = self.make_packed_matmul(
+                attention.q_proj.weight.detach().numpy(), 
+                attention.k_proj.weight.detach().numpy(), 
+                attention.v_proj.weight.detach().numpy(), 
+                qkv_matmul_name, 
+                root_input
+            )
+
+            if kwargs.get("has_qkv_proj_lora", False):
+                qkv_module_name = f"/model/layers.{layer_id}/attn/qkv_proj"
+                qkv_lora_output = self.make_lora_adapters(
+                    attention.qkv_proj_lora_A_weight,
+                    attention.qkv_proj_lora_B_weight,
+                    attention.qkv_proj_lora_scaling,
+                    qkv_module_name,
+                    root_input
+                )
+
+                q_input_to_attention = self.make_add(
+                    f"{qkv_module_name}/lora/Add", 
+                    [q_input_to_attention, qkv_lora_output], 
+                    dtype=self.io_dtype, 
+                    shape=['batch_size', 'sequence_length', attention.qkv_size]
+                )
         else:
-            q_matmul_name = f"/model/layers.{layer_id}/attn/q_proj/MatMul"
-            self.make_matmul(attention.q_proj.weight.detach().numpy(), q_matmul_name, root_input)
-            q_input_to_attention = f"{q_matmul_name}/output_0"
-            k_matmul_name = f"/model/layers.{layer_id}/attn/k_proj/MatMul"
-            self.make_matmul(attention.k_proj.weight.detach().numpy(), k_matmul_name, root_input)
-            k_input_to_attention = f"{k_matmul_name}/output_0"
-            v_matmul_name = f"/model/layers.{layer_id}/attn/v_proj/MatMul"
-            self.make_matmul(attention.v_proj.weight.detach().numpy(), v_matmul_name, root_input)
-            v_input_to_attention = f"{v_matmul_name}/output_0"
+            q_module_name = f"/model/layers.{layer_id}/attn/q_proj"
+            q_input_to_attention = self.make_matmul_or_lora(attention.q_proj, q_module_name, root_input)
+            k_module_name = f"/model/layers.{layer_id}/attn/k_proj"
+            k_input_to_attention = self.make_matmul_or_lora(attention.k_proj, k_module_name, root_input)
+            v_module_name = f"/model/layers.{layer_id}/attn/v_proj"
+            v_input_to_attention = self.make_matmul_or_lora(attention.v_proj, v_module_name, root_input)
+
+            if kwargs.get("has_qkv_proj_lora"):
+                qkv_module_name = f"/model/layers.{layer_id}/attn/qkv_proj"
+                q_input_to_attention, k_input_to_attention, v_input_to_attention = self.make_lora_split_add(
+                    attention.qkv_proj_lora_A_weight,
+                    attention.qkv_proj_lora_B_weight,
+                    attention.qkv_proj_lora_scaling,
+                    qkv_module_name,
+                    root_input,
+                    [q_input_to_attention, k_input_to_attention, v_input_to_attention],
+                    ["q_proj", "k_proj", "v_proj"],
+                    [attention.q_size, attention.kv_size, attention.kv_size]
+                )
 
         # Make Add nodes (if bias exists)
         q_bias_exists = attention.q_proj.bias is not None
@@ -987,7 +1148,7 @@ class Model:
         v_bias_exists = attention.v_proj.bias is not None
         all_bias_exists = q_bias_exists and k_bias_exists and v_bias_exists
 
-        if all_bias_exists and self.attention_attrs["use_packed_matmul"]:
+        if all_bias_exists and self.attention_attrs["use_packed_matmul"] and not has_lora_adapters:
             # Combine 3 Adds into 1 packed Add
             qkv_add_name = f"/model/layers.{layer_id}/attn/qkv_proj/Add"
             self.make_packed_add(attention.q_proj.bias.detach().numpy(), attention.k_proj.bias.detach().numpy(), attention.v_proj.bias.detach().numpy(), qkv_add_name, root_input=q_input_to_attention)
@@ -1038,19 +1199,19 @@ class Model:
 
         # Make MatMul node (output projection weight node)
         o_proj = 'o_proj' if hasattr(attention, 'o_proj') else 'dense'
-        o_matmul_name = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
-        o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
-        self.make_matmul(o_weight, o_matmul_name, f"{attn_name}/output_0")
+        o_module_name = f"/model/layers.{layer_id}/attn/o_proj"
+        o_linear = eval(f"attention.{o_proj}")
+        o_output = self.make_matmul_or_lora(o_linear, o_module_name, root_input=f"{attn_name}/output_0")
 
         # Make Add node (output projection bias node if bias exists)
         o_bias_exists = eval(f"attention.{o_proj}.bias") is not None
         if o_bias_exists:
             o_add_name = f"/model/layers.{layer_id}/attn/o_proj/Add"
             o_bias = eval(f"attention.{o_proj}.bias.detach().numpy()")
-            self.make_add_bias(o_bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
+            o_bias_output = self.make_add_bias(o_bias, o_add_name, root_input=o_output)
 
         # Assign output 0 of previous output node as skip input to next SkipLayerNorm
-        self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
+        self.layernorm_attrs["skip_input"] = o_output if not o_bias_exists else o_bias_output
 
     def make_mlp(self, layer_id, mlp, root_input):
         if self.mlp_attrs["use_proj"]:
@@ -1060,7 +1221,7 @@ class Model:
         else:
             raise NotImplementedError(f"The MLP layer type is not set.")
 
-    def make_mlp_proj(self, layer_id, mlp, root_input):
+    def make_mlp_proj(self, layer_id, mlp, root_input, **kwargs):
         # Make nodes for the MLP subgraph
         #
         #           root_input
@@ -1074,25 +1235,38 @@ class Model:
         #        DownProjMatMul
 
         # Make MatMul nodes
-        gate_name = f"/model/layers.{layer_id}/mlp/gate_proj/MatMul"
-        self.make_matmul(mlp.gate_proj.weight.detach().numpy(), gate_name, root_input)
-        up_name = f"/model/layers.{layer_id}/mlp/up_proj/MatMul"
-        self.make_matmul(mlp.up_proj.weight.detach().numpy(), up_name, root_input)
+        gate_module_name = f"/model/layers.{layer_id}/mlp/gate_proj"
+        gate_matmul_output = self.make_matmul_or_lora(mlp.gate_proj, gate_module_name, root_input)
+        up_module_name = f"/model/layers.{layer_id}/mlp/up_proj"
+        up_matmul_output = self.make_matmul_or_lora(mlp.up_proj, up_module_name, root_input)
+
+        if kwargs.get("has_gate_up_proj_lora", False):
+            gate_up_module_name = f"/model/layers.{layer_id}/mlp/gate_up_proj"
+            gate_matmul_output, up_matmul_output = self.make_lora_split_add(
+                mlp.gate_up_proj_lora_A_weight,
+                mlp.gate_up_proj_lora_B_weight,
+                mlp.gate_up_proj_lora_scaling,
+                gate_up_module_name,
+                root_input,
+                [gate_matmul_output, up_matmul_output],
+                ["gate_proj", "up_proj"],
+                [self.intermediate_size, self.intermediate_size]
+            )
 
         # Make activation node(s)
-        act_fn_name = self.make_activation(layer_id, root_input=f"{gate_name}/output_0")
+        act_fn_output = self.make_activation(layer_id, root_input=gate_matmul_output)
 
         # Make Mul node after activation
         mul_name = f"/model/layers.{layer_id}/mlp/Mul"
-        mul_inputs = [f"{act_fn_name}/output_0", f"{up_name}/output_0"]
-        self.make_mul(mul_name, mul_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
+        mul_inputs = [act_fn_output, up_matmul_output]
+        mul_output = self.make_mul(mul_name, mul_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
 
         # Make output MatMul node
-        down_name = f"/model/layers.{layer_id}/mlp/down_proj/MatMul"
-        self.make_matmul(mlp.down_proj.weight.detach().numpy(), down_name, f"{mul_name}/output_0")
+        down_module_name = f"/model/layers.{layer_id}/mlp/down_proj"
+        down_matmul_output = self.make_matmul_or_lora(mlp.down_proj, down_module_name, mul_output)
 
         # Assign output 0 of previous MatMul as skip input to next SkipLayerNorm
-        self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
+        self.layernorm_attrs["skip_input"] = down_matmul_output
 
     def make_mlp_fc(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
@@ -1110,22 +1284,22 @@ class Model:
         #           FC2_Add
 
         # Make first layer of fully connected nodes (FC1)
-        fc1_matmul_name = f"/model/layers.{layer_id}/mlp/fc1/MatMul"
-        self.make_matmul(mlp.fc1.weight.detach().numpy(), fc1_matmul_name, root_input)
+        fc1_module_name = f"/model/layers.{layer_id}/mlp/fc1"
+        fc1_matmul_output = self.make_matmul_or_lora(mlp.fc1, fc1_module_name, root_input)
         fc1_add_name = f"/model/layers.{layer_id}/mlp/fc1/Add"
-        self.make_add_bias(mlp.fc1.bias.detach().numpy(), fc1_add_name, root_input=f"{fc1_matmul_name}/output_0")
+        fc1_add_output = self.make_add_bias(mlp.fc1.bias.detach().numpy(), fc1_add_name, root_input=fc1_matmul_output)
 
         # Make activation function
-        act_fn_name = self.make_activation(layer_id, root_input=f"{fc1_add_name}/output_0")
+        act_fn_output = self.make_activation(layer_id, root_input=fc1_add_output)
 
         # Make second layer of fully connected nodes (FC2)
-        fc2_matmul_name = f"/model/layers.{layer_id}/mlp/fc2/MatMul"
-        self.make_matmul(mlp.fc2.weight.detach().numpy(), fc2_matmul_name, root_input=f"{act_fn_name}/output_0")
+        fc2_module_name = f"/model/layers.{layer_id}/mlp/fc2"
+        fc2_matmul_output = self.make_matmul_or_lora(mlp.fc2, fc2_module_name, root_input=act_fn_output)
         fc2_add_name = f"/model/layers.{layer_id}/mlp/fc2/Add"
-        self.make_add_bias(mlp.fc2.bias.detach().numpy(), fc2_add_name, root_input=f"{fc2_matmul_name}/output_0")
+        fc2_add_output = self.make_add_bias(mlp.fc2.bias.detach().numpy(), fc2_add_name, root_input=fc2_matmul_output)
 
         # Assign output 0 of MLP layer as output of last layer
-        self.mlp_attrs["output_0"] = f"{fc2_add_name}/output_0"
+        self.mlp_attrs["output_0"] = fc2_add_output
 
     def make_activation_with_mul(self, layer_id, root_input, activation, domain):
         # Make nodes for this activation subgraph
@@ -1142,9 +1316,9 @@ class Model:
 
         mul_act_name = f"/model/layers.{layer_id}/mlp/act_fn/Mul"
         mul_act_inputs = [root_input, act_output]
-        self.make_mul(mul_act_name, mul_act_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
+        mul_act_output = self.make_mul(mul_act_name, mul_act_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
 
-        return mul_act_name
+        return mul_act_output
 
     def make_gelu(self, layer_id, root_input, activation):
         # Make nodes for this activation subgraph
@@ -1157,7 +1331,7 @@ class Model:
         self.make_node(activation, inputs=[root_input], outputs=[output], name=gelu_name, domain="com.microsoft")
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.intermediate_size])
 
-        return gelu_name
+        return output
 
     def make_activation(self, layer_id, root_input):
         if self.activation in {"silu", "swish"}:
@@ -1174,11 +1348,13 @@ class Model:
         bias_exists = lm_head.bias is not None
         matmul_name = "/lm_head/MatMul"
         root_input = self.layernorm_attrs["output_0"]
-        self.make_matmul(lm_head.weight.detach().numpy(), matmul_name, root_input, logits=not bias_exists)
+
+        # lm_head is not expected to have lora adapters
+        lm_matmul_output = self.make_matmul(lm_head.weight.detach().numpy(), matmul_name, root_input, logits=not bias_exists)
 
         if bias_exists:
             add_name = "/lm_head/Add"
-            self.make_add_bias(lm_head.bias.detach().numpy(), add_name, root_input=f"{matmul_name}/output_0", logits=True)
+            self.make_add_bias(lm_head.bias.detach().numpy(), add_name, root_input=lm_matmul_output, logits=True)
 
     def make_layer(self, layer_id, layer):
         # Each LLM decoder layer is typically defined as:
@@ -1193,7 +1369,7 @@ class Model:
             # Norm after last decoder layer of model (last layer --> norm)
             self.layernorm_attrs["last_layernorm"] = True
 
-    def make_model(self, input_path):
+    def make_model(self, hf_name, input_path, adapter_path):
         # Make inputs and outputs to ONNX model
         self.make_inputs_and_outputs()
 
@@ -1209,7 +1385,13 @@ class Model:
         else:
             # Load PyTorch model
             extra_kwargs = {} if os.path.exists(self.model_name_or_path) else {"num_hidden_layers": self.num_layers} if "num_hidden_layers" in self.extra_options else {"cache_dir": self.cache_dir}
-            model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+            model = AutoModelForCausalLM.from_pretrained(hf_name, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+
+            if adapter_path:
+                from peft import PeftModel
+
+                # load adapter, use get_base_model() to remove the PeftModel wrapper
+                model = PeftModel.from_pretrained(model, adapter_path).get_base_model()
 
         # Loop through model and map each module to ONNX/ORT ops
         self.layer_id = 0
@@ -1715,20 +1897,30 @@ class Phi3Mini4KModel(MistralModel):
         q_size = self.num_attn_heads * self.head_size
         kv_size = self.num_kv_heads * self.head_size
 
-        attention.q_proj = torch.nn.Linear(in_features=q_size, out_features=q_size)
+        attention.q_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=q_size)
         attention.q_proj.weight = torch.nn.Parameter(attention.qkv_proj.weight[: q_size, :])
         attention.q_proj.bias = None if attention.qkv_proj.bias is None else torch.nn.Parameter(attention.qkv_proj.bias[: q_size])
 
-        attention.k_proj = torch.nn.Linear(in_features=q_size, out_features=kv_size)
+        attention.k_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=kv_size)
         attention.k_proj.weight = torch.nn.Parameter(attention.qkv_proj.weight[q_size : q_size + kv_size, :])
         attention.k_proj.bias = None if attention.qkv_proj.bias is None else torch.nn.Parameter(attention.qkv_proj.bias[q_size : q_size + kv_size])
 
-        attention.v_proj = torch.nn.Linear(in_features=q_size, out_features=kv_size)
+        attention.v_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=kv_size)
         attention.v_proj.weight = torch.nn.Parameter(attention.qkv_proj.weight[q_size + kv_size :, :])
         attention.v_proj.bias = None if attention.qkv_proj.bias is None else torch.nn.Parameter(attention.qkv_proj.bias[q_size + kv_size :])
 
+        # store the lora linears too
+        has_qkv_proj_lora = hasattr(attention.qkv_proj, "lora_A") and hasattr(attention.qkv_proj, "lora_B")
+        if has_qkv_proj_lora:
+            attention.q_size = q_size
+            attention.kv_size = kv_size
+            attention.qkv_size = q_size + 2 * kv_size
+            attention.qkv_proj_lora_A_weight = attention.qkv_proj.lora_A.default.weight.detach().numpy()
+            attention.qkv_proj_lora_B_weight = attention.qkv_proj.lora_B.default.weight.detach().numpy()
+            attention.qkv_proj_lora_scaling = attention.qkv_proj.scaling["default"]
+
         del attention.qkv_proj
-        super().make_attention(layer_id, attention, root_input, **kwargs)
+        super().make_attention(layer_id, attention, root_input, has_qkv_proj_lora=has_qkv_proj_lora, **kwargs)
 
     def make_mlp_proj(self, layer_id, mlp, root_input):
         mlp.gate_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=self.intermediate_size)
@@ -1737,8 +1929,14 @@ class Phi3Mini4KModel(MistralModel):
         mlp.up_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=self.intermediate_size)
         mlp.up_proj.weight = torch.nn.Parameter(mlp.gate_up_proj.weight[self.intermediate_size :, :])
 
+        has_gate_up_proj_lora = hasattr(mlp.gate_up_proj, "lora_A") and hasattr(mlp.gate_up_proj, "lora_B")
+        if has_gate_up_proj_lora:
+            mlp.gate_up_proj_lora_A_weight = mlp.gate_up_proj.lora_A.default.weight.detach().numpy()
+            mlp.gate_up_proj_lora_B_weight = mlp.gate_up_proj.lora_B.default.weight.detach().numpy()
+            mlp.gate_up_proj_lora_scaling = mlp.gate_up_proj.scaling["default"]
+
         del mlp.gate_up_proj
-        super().make_mlp_proj(layer_id, mlp, root_input)
+        super().make_mlp_proj(layer_id, mlp, root_input, has_gate_up_proj_lora=has_gate_up_proj_lora)
 
 
 class Phi3Mini128KModel(Phi3Mini4KModel):
@@ -1868,7 +2066,7 @@ def parse_extra_options(kv_items):
     return kv_pairs
 
 
-def create_model(model_name, input_path, output_dir, precision, execution_provider, cache_dir, **extra_options):
+def create_model(model_name, input_path, adapter_path, output_dir, precision, execution_provider, cache_dir, **extra_options):
     # Create cache and output directories
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
@@ -1899,7 +2097,7 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             raise NotImplementedError(f"The {hf_name} model is not currently supported.")
 
         # Make ONNX model
-        onnx_model.make_model(input_path)
+        onnx_model.make_model(hf_name, input_path, adapter_path)
 
         # Save ONNX model
         onnx_model.save_model(output_dir)
@@ -1934,6 +2132,14 @@ def get_args():
                 hf_path: Path to folder on disk containing the Hugging Face config, model, tokenizer, etc.
                 gguf_path: Path to float16/float32 GGUF file on disk containing the GGUF model
             """),
+    )
+
+    parser.add_argument(
+        "-a",
+        "--adapter_path",
+        required=False,
+        default=None,
+        help="Path to folder containing the adapter files (adapter config, adapter model, etc.)",
     )
 
     parser.add_argument(
@@ -1996,6 +2202,7 @@ def get_args():
                 enable_cuda_graph = 1 : The model can use CUDA graph capture for CUDA execution provider. If enabled, all nodes being placed on the CUDA EP
                     is the prerequisite for the CUDA graph to be used correctly. It is not guaranteed that cuda graph be enabled as it depends on the model
                     and the graph structure.
+                merge_lora_scaling = 1: Multiply lora_B weight with scale factor instead of creating a separate Mul node.
             """),
     )
 
@@ -2006,4 +2213,4 @@ def get_args():
 if __name__ == '__main__':
     args = get_args()
     extra_options = parse_extra_options(args.extra_options)
-    create_model(args.model_name, args.input, args.output, args.precision, args.execution_provider, args.cache_dir, **extra_options)
+    create_model(args.model_name, args.input, args.adapter_path, args.output, args.precision, args.execution_provider, args.cache_dir, **extra_options)
